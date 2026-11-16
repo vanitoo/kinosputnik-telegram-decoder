@@ -1,0 +1,562 @@
+#!/usr/bin/env python
+"""
+Proxy Manager v1.3.2
+
+Универсальный менеджер прокси для aiogram/aiohttp.
+
+Режимы:
+- off      — прокси отключены, соединение напрямую.
+- single   — используется один прокси; при ошибке список циклически перебирается без остановки.
+- sticky   — выбирается один живой прокси и держится до ошибки. После ошибки переключается на следующий живой.
+- failover — приоритетный режим: сначала используется proxy #0. Если он упал — переход на proxy #1/#2/... .
+             Health-check периодически проверяет упавшие прокси и, когда primary оживает, возвращает его в работу.
+- random   — при каждом выборе берется случайный живой прокси.
+- rotate   — при каждом выборе берется следующий живой прокси.
+
+Формат списка прокси:
+PROXY=http://user:pass@host:3128,http://user:pass@host:3129;socks5://user:pass@host:1080
+
+Также поддерживаются разделители:
+- запятая
+- точка с запятой
+- перенос строки
+
+Поддерживаемые схемы:
+- http://
+- https://
+- socks5://
+
+Для SOCKS5 нужен пакет:
+pip install aiohttp-socks
+
+Health-check:
+- check_proxy(proxy) проверяет конкретный прокси.
+- start_healthcheck_loop() запускает фоновую проверку упавших прокси.
+- Для failover режим отличается от sticky именно возвратом на primary после восстановления.
+- В sticky фоновая проверка опрашивает только текущий прокси; резервные проверяются только после его отказа.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import random
+import re
+from enum import Enum
+from typing import Optional
+
+log = logging.getLogger(__name__)
+
+__version__ = "1.3.2"
+
+
+class ProxyMode(str, Enum):
+    OFF = "off"
+    SINGLE = "single"
+    FAILOVER = "failover"
+    STICKY = "sticky"
+    RANDOM = "random"
+    ROTATE = "rotate"
+
+    @classmethod
+    def normalize(cls, value: str | None) -> "ProxyMode":
+        raw = (value or cls.OFF.value).strip().lower()
+        aliases = {
+            "": cls.OFF,
+            "none": cls.OFF,
+            "no": cls.OFF,
+            "disabled": cls.OFF,
+            "disable": cls.OFF,
+            "on": cls.FAILOVER,
+            "true": cls.FAILOVER,
+            "yes": cls.FAILOVER,
+            "1": cls.FAILOVER,
+            "fallback": cls.FAILOVER,
+            "priority": cls.FAILOVER,
+        }
+        if raw in aliases:
+            return aliases[raw]
+        try:
+            return cls(raw)
+        except ValueError:
+            log.warning("Неизвестный PROXY_MODE=%r, используется failover", value)
+            return cls.FAILOVER
+
+
+def mask_proxy_url(proxy_url: str) -> str:
+    """Маскирует пароль в URL прокси для безопасного логирования."""
+    if "://" not in proxy_url:
+        return proxy_url
+    protocol, rest = proxy_url.split("://", 1)
+    if "@" not in rest:
+        return proxy_url
+    auth, host_port = rest.split("@", 1)
+    if ":" in auth:
+        user = auth.split(":", 1)[0]
+        return f"{protocol}://{user}:***@{host_port}"
+    return proxy_url
+
+
+def to_telethon_proxy(proxy_url: str) -> tuple:
+    """Convert a proxy URL into a Telethon proxy tuple (socks5/socks4/http/https).
+
+    Telethon accepts PySocks *or* python_socks proxy types. The numeric
+    constants are identical in both (SOCKS4=1, SOCKS5=2, HTTP=3), so they are
+    passed as plain ints to avoid importing either library here.
+    Telethon expects a 6-element tuple:
+        (proxy_type, host, port, rdns, username, password)
+    """
+    protocol, rest = proxy_url.split("://", 1)
+    protocol = protocol.lower()
+    # SOCKS4=1, SOCKS5=2, HTTP=3 (same in PySocks and python_socks).
+    types = {"socks5": 2, "socks4": 1, "http": 3, "https": 3}
+    if protocol not in types:
+        raise ValueError(f"Неподдерживаемая схема для Telethon: {protocol}")
+    username = password = None
+    if "@" in rest:
+        auth, host_port = rest.rsplit("@", 1)
+        username, _, password = auth.partition(":")
+    else:
+        host_port = rest
+    host, _, port = host_port.partition(":")
+    if not port:
+        raise ValueError(f"Прокси без порта: {mask_proxy_url(proxy_url)}")
+    return (types[protocol], host, int(port), True, username, password or "")
+
+
+class ProxyManager:
+    """Управление списком прокси с режимами single/sticky/failover/random/rotate."""
+
+    def __init__(
+        self,
+        proxies: list[str],
+        mode: str | ProxyMode = ProxyMode.OFF,
+        *,
+        healthcheck_url: str = "https://api.telegram.org",
+        healthcheck_timeout: float = 8.0,
+        healthcheck_interval: float = 60.0,
+        ssl_verify: bool = True,
+    ):
+        self.proxies = [p.strip() for p in proxies if p and p.strip()]
+        self.mode = ProxyMode.normalize(str(mode)) if not isinstance(mode, ProxyMode) else mode
+        self.current_index = 0
+        self._rotate_started = False
+        self.failed_proxies: set[int] = set()
+        self.max_failures = 3
+        self.failure_counts: dict[int, int] = {}
+        self._pending_proxy: Optional[str] = None
+        self.healthcheck_url = healthcheck_url
+        self.healthcheck_timeout = float(healthcheck_timeout)
+        self.healthcheck_interval = float(healthcheck_interval)
+        self.ssl_verify = bool(ssl_verify)
+        self._healthcheck_task: Optional[asyncio.Task] = None
+
+        if not self.proxies:
+            self.mode = ProxyMode.OFF
+
+        if self.mode == ProxyMode.OFF:
+            log.info("ProxyManager v%s: прокси отключены", __version__)
+        else:
+            log.info(
+                "ProxyManager v%s: mode=%s, proxies=%d, healthcheck=%s",
+                __version__, self.mode.value, len(self.proxies), self.healthcheck_url,
+            )
+
+    @classmethod
+    def from_env_string(
+        cls,
+        proxy_string: str | None,
+        mode: str | ProxyMode = ProxyMode.FAILOVER,
+        *,
+        healthcheck_url: str = "https://api.telegram.org",
+        healthcheck_timeout: float = 8.0,
+        healthcheck_interval: float = 60.0,
+        ssl_verify: bool = True,
+    ) -> "ProxyManager":
+        proxy_string = proxy_string or ""
+        proxies = [p.strip() for p in re.split(r"[,;\n\r]+", proxy_string) if p.strip()]
+        return cls(
+            proxies,
+            mode=mode,
+            healthcheck_url=healthcheck_url,
+            healthcheck_timeout=healthcheck_timeout,
+            healthcheck_interval=healthcheck_interval,
+            ssl_verify=ssl_verify,
+        )
+
+    @property
+    def has_proxies(self) -> bool:
+        return bool(self.proxies) and self.mode != ProxyMode.OFF
+
+    @property
+    def current_proxy(self) -> Optional[str]:
+        if not self.has_proxies:
+            return None
+        return self.proxies[self.current_index]
+
+    def _active_indexes(self) -> list[int]:
+        if not self.has_proxies:
+            return []
+        return [i for i in range(len(self.proxies)) if i not in self.failed_proxies]
+
+    def _best_failover_index(self) -> Optional[int]:
+        """Для failover выбираем самый приоритетный живой индекс: 0, потом 1, потом 2..."""
+        active = self._active_indexes()
+        return min(active) if active else None
+
+    def get_proxy(self) -> Optional[str]:
+        """Вернуть прокси согласно текущему режиму."""
+        active = self._active_indexes()
+        if not active:
+            if self.has_proxies:
+                log.error("Нет доступных прокси: все помечены как нерабочие")
+            return None
+
+        if self.mode == ProxyMode.SINGLE:
+            # В single сохраняем текущий адрес, но при его отказе разрешаем
+            # переход к следующему прокси из списка.
+            if self.current_index not in active:
+                self.current_index = active[0]
+        elif self.mode == ProxyMode.FAILOVER:
+            best = self._best_failover_index()
+            if best is None:
+                return None
+            if best != self.current_index:
+                log.info(
+                    "Failover выбирает приоритетный прокси #%d: %s",
+                    best, mask_proxy_url(self.proxies[best]),
+                )
+            self.current_index = best
+        elif self.mode == ProxyMode.RANDOM:
+            self.current_index = random.choice(active)
+        elif self.mode == ProxyMode.ROTATE:
+            if self._rotate_started:
+                nxt = self._next_active_index(step_from_current=True)
+                self.current_index = active[0] if nxt is None else nxt
+            elif self.current_index not in active:
+                self.current_index = active[0]
+            self._rotate_started = True
+        else:
+            # sticky: продолжаем использовать текущий, если он жив.
+            if self.current_index not in active:
+                self.current_index = active[0]
+
+        return self.proxies[self.current_index]
+
+    def _next_active_index(self, step_from_current: bool = False) -> Optional[int]:
+        if not self.has_proxies:
+            return None
+        index = (self.current_index + 1) % len(self.proxies) if step_from_current else self.current_index
+        for _ in range(len(self.proxies)):
+            if index not in self.failed_proxies:
+                return index
+            index = (index + 1) % len(self.proxies)
+        return None
+
+    def next_proxy(self) -> Optional[str]:
+        """Принудительно перейти к следующему живому прокси."""
+        idx = self._next_active_index(step_from_current=True)
+        if idx is None:
+            return None
+        self.current_index = idx
+        return self.proxies[idx]
+
+    def mark_proxy_failed(self, proxy: Optional[str] = None) -> None:
+        """Пометить прокси как нерабочий и при необходимости переключиться."""
+        if not self.has_proxies:
+            return
+
+        proxy = proxy or self.current_proxy
+        if not proxy or proxy not in self.proxies:
+            return
+
+        index = self.proxies.index(proxy)
+        self.failure_counts[index] = self.failure_counts.get(index, 0) + 1
+
+        self.failed_proxies.add(index)
+        log.warning(
+            "Прокси %s помечен как нерабочий (ошибок: %d/%d)",
+            mask_proxy_url(proxy), self.failure_counts[index], self.max_failures,
+        )
+
+        if self.current_proxy == proxy:
+            if self.mode == ProxyMode.FAILOVER:
+                idx = self._best_failover_index()
+                if idx is None:
+                    # Все адреса уже дали ошибку: начинаем новый круг
+                    # проверки вместо остановки.
+                    self.failed_proxies.clear()
+                    idx = self._best_failover_index()
+                    log.warning("Все прокси недоступны — начинается новый круг проверки")
+                if idx is not None:
+                    self.current_index = idx
+                    log.info("Failover переключился на прокси #%d: %s", idx, mask_proxy_url(self.proxies[idx]))
+                else:
+                    log.error("Нет доступных прокси для failover")
+            else:
+                new_proxy = self.next_proxy()
+                if new_proxy is None and self.proxies:
+                    # Все адреса уже дали ошибку. Начинаем бесконечный новый
+                    # круг проверки вместо остановки приложения.
+                    self.failed_proxies.clear()
+                    new_proxy = self.next_proxy()
+                    log.warning("Все прокси недоступны — начинается новый круг проверки")
+                if new_proxy:
+                    log.info("Переключение на прокси: %s", mask_proxy_url(new_proxy))
+                else:
+                    log.error("Нет доступных прокси для переключения")
+
+    def reset_proxy(self, proxy: Optional[str] = None) -> None:
+        """Сбросить метки ошибок."""
+        if proxy is None:
+            self.failed_proxies.clear()
+            self.failure_counts.clear()
+            if self.mode == ProxyMode.FAILOVER:
+                self.current_index = 0
+            log.info("Все прокси сброшены в активное состояние")
+            return
+
+        if proxy in self.proxies:
+            index = self.proxies.index(proxy)
+            self.failed_proxies.discard(index)
+            self.failure_counts[index] = 0
+            log.info("Прокси %s сброшен", mask_proxy_url(proxy))
+            if self.mode == ProxyMode.FAILOVER and index < self.current_index:
+                self.current_index = index
+                log.info("Failover вернулся на более приоритетный прокси #%d: %s", index, mask_proxy_url(proxy))
+
+    async def check_proxy(self, proxy: str) -> bool:
+        """Проверить, что через прокси открывается healthcheck_url."""
+        import aiohttp
+
+        protocol = proxy.split("://", 1)[0].lower() if "://" in proxy else ""
+        timeout = aiohttp.ClientTimeout(total=self.healthcheck_timeout)
+
+        try:
+            if protocol == "socks5":
+                try:
+                    import aiohttp_socks
+                except ImportError:
+                    log.error("aiohttp-socks не установлен: pip install aiohttp-socks")
+                    return False
+                connector = aiohttp_socks.ProxyConnector.from_url(proxy)
+                async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                    async with session.get(self.healthcheck_url, ssl=self.ssl_verify) as response:
+                        return response.status < 500
+
+            if protocol in {"http", "https"}:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.get(self.healthcheck_url, proxy=proxy, ssl=self.ssl_verify) as response:
+                        return response.status < 500
+
+            log.warning("Неизвестный протокол прокси для health-check: %s", protocol or "без схемы")
+            return False
+        except Exception as exc:
+            log.warning("Health-check failed for %s: %s: %s", mask_proxy_url(proxy), type(exc).__name__, exc)
+            return False
+
+    async def check_sticky(self) -> dict[int, bool]:
+        """Check only the selected proxy; probe alternatives only after its failure."""
+        if not self.has_proxies:
+            return {}
+
+        results: dict[int, bool] = {}
+        current = self.current_index
+        current_ok = await self.check_proxy(self.proxies[current])
+        results[current] = current_ok
+        if current_ok:
+            if current in self.failed_proxies or self.failure_counts.get(current, 0):
+                self.reset_proxy(self.proxies[current])
+            return results
+
+        self.failure_counts[current] = self.failure_counts.get(current, 0) + 1
+        self.failed_proxies.add(current)
+        for offset in range(1, len(self.proxies) + 1):
+            candidate = (current + offset) % len(self.proxies)
+            if candidate == current:
+                continue
+            ok = await self.check_proxy(self.proxies[candidate])
+            results[candidate] = ok
+            if ok:
+                self.reset_proxy(self.proxies[candidate])
+                self.current_index = candidate
+                log.info("Sticky switched to proxy #%d: %s", candidate, mask_proxy_url(self.proxies[candidate]))
+                return results
+            self.failure_counts[candidate] = self.failure_counts.get(candidate, 0) + 1
+            self.failed_proxies.add(candidate)
+        log.error("Sticky has no healthy proxies; keeping current proxy #%d", current)
+        return results
+
+    async def check_all(self) -> dict[int, bool]:
+        """Проверить все прокси и обновить их состояние."""
+        if not self.has_proxies:
+            return {}
+
+        results: dict[int, bool] = {}
+        for index, proxy in enumerate(self.proxies):
+            ok = await self.check_proxy(proxy)
+            results[index] = ok
+            if ok:
+                if index in self.failed_proxies or self.failure_counts.get(index, 0):
+                    self.reset_proxy(proxy)
+            else:
+                self.failure_counts[index] = self.failure_counts.get(index, 0) + 1
+                self.failed_proxies.add(index)
+
+        if self.mode == ProxyMode.FAILOVER:
+            best = self._best_failover_index()
+            if best is not None and best != self.current_index:
+                self.current_index = best
+                log.info("Failover выбрал лучший живой прокси #%d: %s", best, mask_proxy_url(self.proxies[best]))
+        elif self.mode == ProxyMode.SINGLE and self.current_index in self.failed_proxies:
+            next_index = self._next_active_index(step_from_current=True)
+            if next_index is None:
+                self.failed_proxies.clear()
+                next_index = (self.current_index + 1) % len(self.proxies)
+            self.current_index = next_index
+            log.info("Single выбрал следующий прокси #%d: %s", next_index, mask_proxy_url(self.proxies[next_index]))
+        return results
+
+    async def start_healthcheck_loop(self) -> None:
+        """Фоновый health-check. Особенно важен для failover, чтобы возвращаться на primary."""
+        if not self.has_proxies or self.healthcheck_interval <= 0:
+            return
+        if self._healthcheck_task and not self._healthcheck_task.done():
+            return
+
+        async def _loop() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(self.healthcheck_interval)
+                    if self.mode == ProxyMode.STICKY:
+                        await self.check_sticky()
+                    else:
+                        await self.check_all()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    log.exception("Ошибка в proxy health-check loop")
+
+        self._healthcheck_task = asyncio.create_task(_loop(), name="proxy-healthcheck")
+        log.info("Proxy health-check loop started: interval=%ss, url=%s", self.healthcheck_interval, self.healthcheck_url)
+
+    async def stop_healthcheck_loop(self) -> None:
+        if self._healthcheck_task and not self._healthcheck_task.done():
+            self._healthcheck_task.cancel()
+            try:
+                await self._healthcheck_task
+            except asyncio.CancelledError:
+                pass
+
+    def get_session(self) -> Optional["AiohttpSession"]:
+        import aiohttp
+
+        """Создать сессию Aiogram с прокси согласно режиму."""
+        from aiogram.client.session.aiohttp import AiohttpSession
+
+        proxy = self.get_proxy()
+        if not proxy:
+            return None
+
+        protocol = proxy.split("://", 1)[0].lower() if "://" in proxy else ""
+
+        try:
+            if protocol == "socks5":
+                try:
+                    import aiohttp_socks
+                except ImportError:
+                    log.error("aiohttp-socks не установлен: pip install aiohttp-socks")
+                    self.mark_proxy_failed(proxy)
+                    return None
+
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    connector = aiohttp_socks.ProxyConnector.from_url(proxy)
+                    session = AiohttpSession(connector=connector)
+                    log.info("Создана сессия с SOCKS5 прокси: %s", mask_proxy_url(proxy))
+                    return session
+
+                self._pending_proxy = proxy
+                log.info("Event loop не запущен, SOCKS5 сессия будет создана через get_session_sync")
+                return None
+
+            if protocol in {"http", "https"}:
+                session = AiohttpSession(proxy=proxy)
+                if not self.ssl_verify:
+                    # Aiogram creates its own TCPConnector with the certifi CA bundle.
+                    # Explicit compatibility mode is required for proxies performing TLS inspection.
+                    session._connector_init["ssl"] = False
+                    log.warning("Проверка SSL отключена для Telegram-сессии через прокси")
+                log.info("Создана сессия с HTTP/HTTPS прокси: %s", mask_proxy_url(proxy))
+                return session
+
+            log.warning("Неизвестный протокол прокси: %s", protocol or "без схемы")
+            self.mark_proxy_failed(proxy)
+            return None
+
+        except Exception as exc:
+            log.error("Ошибка создания сессии с прокси %s: %s", mask_proxy_url(proxy), exc)
+            self.mark_proxy_failed(proxy)
+            return None
+
+    def get_session_sync(self) -> Optional["AiohttpSession"]:
+        import aiohttp
+
+        """Создать сессию после старта event loop, если SOCKS5 был отложен."""
+        from aiogram.client.session.aiohttp import AiohttpSession
+
+        proxy = self._pending_proxy or self.get_proxy()
+        if not proxy:
+            return None
+
+        protocol = proxy.split("://", 1)[0].lower() if "://" in proxy else ""
+        if protocol != "socks5":
+            return self.get_session()
+
+        try:
+            import aiohttp_socks
+            connector = aiohttp_socks.ProxyConnector.from_url(proxy)
+            session = AiohttpSession(connector=connector)
+            log.info("Создана сессия с SOCKS5 прокси: %s", mask_proxy_url(proxy))
+            return session
+        except Exception as exc:
+            log.error("Ошибка создания SOCKS5 сессии %s: %s", mask_proxy_url(proxy), exc)
+            self.mark_proxy_failed(proxy)
+            return None
+
+    def get_status(self) -> dict:
+        return {
+            "version": __version__,
+            "mode": self.mode.value,
+            "healthcheck_url": self.healthcheck_url,
+            "healthcheck_interval": self.healthcheck_interval,
+            "ssl_verify": self.ssl_verify,
+            "total": len(self.proxies),
+            "active": len(self._active_indexes()),
+            "current_index": self.current_index if self.proxies else None,
+            "current_proxy": mask_proxy_url(self.current_proxy) if self.current_proxy else None,
+            "proxies": [
+                {
+                    "index": i,
+                    "url": mask_proxy_url(p),
+                    "active": i not in self.failed_proxies,
+                    "failures": self.failure_counts.get(i, 0),
+                    "primary": i == 0,
+                }
+                for i, p in enumerate(self.proxies)
+            ],
+        }
+
+    def telethon_kwargs(self, proxy: Optional[str] = None) -> dict:
+        """Kwargs for telethon.TelegramClient(...) via the selected proxy."""
+        proxy = proxy or self.get_proxy()
+        if not proxy:
+            return {}
+        return {"proxy": to_telethon_proxy(proxy)}
+
+
+    def __repr__(self) -> str:
+        return (
+            f"ProxyManager(version={__version__}, mode={self.mode.value}, "
+            f"proxies={len(self.proxies)}, current={self.current_index}, failed={len(self.failed_proxies)})"
+        )

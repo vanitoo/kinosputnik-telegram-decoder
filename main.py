@@ -10,6 +10,7 @@ import re
 import sqlite3
 
 from decoder import message_blocks, parse_message, public_row
+from proxy_manager import ProxyManager, mask_proxy_url
 from storage import connect, store
 
 ROOT = Path(__file__).resolve().parent
@@ -99,8 +100,37 @@ async def watch_telegram(args, db):
     if not api_id or not api_hash:
         raise SystemExit("Укажите TG_API_ID и TG_API_HASH в .env (получить на my.telegram.org).")
     session = str(ROOT / "telegram_session")
-    client = TelegramClient(session, int(api_id), api_hash)
-    await client.start()  # Telegram phone/code/2FA login on first run.
+    pm = ProxyManager.from_env_string(
+        os.environ.get("TG_PROXY"),
+        mode=os.environ.get("TG_PROXY_MODE", "failover"),
+    )
+    if pm.has_proxies:
+        print(f"Прокси включен (mode={pm.mode.value}): {len(pm.proxies)} шт.")
+        results = await pm.check_all()
+        alive = sum(1 for ok in results.values() if ok)
+        print(f"Health-check прокси: {alive}/{len(pm.proxies)} живых")
+        client = None
+        last_error = None
+        for _ in range(len(pm.proxies)):
+            proxy_url = pm.get_proxy()
+            if proxy_url is None:
+                break
+            candidate = TelegramClient(session, int(api_id), api_hash,
+                                       **pm.telethon_kwargs(proxy_url))
+            try:
+                await candidate.start()  # Telegram phone/code/2FA login on first run.
+                client = candidate
+                print(f"Подключение через прокси: {mask_proxy_url(proxy_url)}")
+                break
+            except Exception as exc:
+                last_error = exc
+                logging.warning("Прокси %s не поднялся: %s", mask_proxy_url(proxy_url), exc)
+                pm.mark_proxy_failed(proxy_url)
+        if client is None:
+            raise SystemExit(f"Ни один прокси не подключился: {last_error}")
+    else:
+        client = TelegramClient(session, int(api_id), api_hash)
+        await client.start()  # Telegram phone/code/2FA login on first run.
     link = args.link
     link_match = re.search(r"(?:https?://)?t\.me/([\w]+)/([0-9]+)", link)
     if not link_match:
@@ -109,10 +139,24 @@ async def watch_telegram(args, db):
     chat = await client.get_entity(username)
     forum = bool(getattr(chat, "forum", False))
     example = await client.get_messages(chat, ids=example_id)
-    if args.topic == "auto":
+    if args.topic_name:
+        from telethon.tl.functions.messages import GetForumTopicsRequest
+        from datetime import datetime, timezone
+        result = await client(GetForumTopicsRequest(
+            peer=chat, limit=100, offset_date=datetime.now(timezone.utc),
+            offset_id=0, offset_topic=0, q=args.topic_name
+        ))
+        matches = [t for t in result.topics if args.topic_name.lower() in t.title.lower()]
+        if not matches:
+            available = ", ".join(t.title for t in result.topics[:20])
+            raise SystemExit(
+                f"Топик '{args.topic_name}' не найден. Доступные: {available}")
+        topic = matches[0].id
+        print(f"Найден топик: '{matches[0].title}' (ID={topic})")
+    elif args.topic == "auto":
         topic = topic_of(example) if example is not None and forum else None
         if forum and topic is None:
-            raise SystemExit("Не удалось распознать тему у сообщения. Задайте --topic ID или --topic all")
+            raise SystemExit("Не удалось распознать тему у сообщения. Задайте --topic ID, --topic all или --topic-name")
     elif args.topic == "all":
         topic = None
     else:
@@ -165,7 +209,8 @@ def main():
     src.add_argument("path")
     watcher = sub.add_parser("watch", help="Telegram: история + новые сообщения")
     watcher.add_argument("--link", default="https://t.me/SatNetworkDB/492030")
-    watcher.add_argument("--topic", default="auto", help="auto, all, или числовой ID темы")
+    watcher.add_argument("--topic", default="auto", help="auto, all, числовой ID темы, или название топика")
+    watcher.add_argument("--topic-name", help="Название топика для поиска (переопределяет --topic)")
     watcher.add_argument("--history", type=int, default=500, help="Сколько последних сообщений просмотреть")
     watcher.add_argument("--once", action="store_true", help="Только история, без мониторинга")
     export = sub.add_parser("export-csv", help="Сохранить телеметрию в CSV")
