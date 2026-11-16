@@ -1,4 +1,6 @@
 Telethon>=1.45,<2
 python-dotenv>=1.0,<2
+python-socks[asyncio]>=2.5,<3
+qrcode>=8,<9
 aiohttp>=3.9,<4
 aiohttp-socks>=0.10,<1
