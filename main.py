@@ -10,7 +10,8 @@ import re
 import sqlite3
 
 from decoder import message_blocks, parse_message, public_row
-from proxy_manager import ProxyManager, mask_proxy_url
+from proxy_manager import ProxyManager
+from telegram_auth import connect_client, ensure_authorized
 from storage import connect, store
 
 ROOT = Path(__file__).resolve().parent
@@ -90,47 +91,41 @@ def is_in_topic(message, topic_id):
     )
 
 
-async def watch_telegram(args, db):
+async def get_authorized_telegram(args):
     from dotenv import load_dotenv
-    from telethon import TelegramClient, events
 
     load_dotenv(ROOT / ".env")
     api_id = os.environ.get("TG_API_ID")
     api_hash = os.environ.get("TG_API_HASH")
     if not api_id or not api_hash:
         raise SystemExit("Укажите TG_API_ID и TG_API_HASH в .env (получить на my.telegram.org).")
-    session = str(ROOT / "telegram_session")
     pm = ProxyManager.from_env_string(
         os.environ.get("TG_PROXY"),
         mode=os.environ.get("TG_PROXY_MODE", "failover"),
     )
     if pm.has_proxies:
-        print(f"Прокси включен (mode={pm.mode.value}): {len(pm.proxies)} шт.")
-        results = await pm.check_all()
-        alive = sum(1 for ok in results.values() if ok)
-        print(f"Health-check прокси: {alive}/{len(pm.proxies)} живых")
-        client = None
-        last_error = None
-        for _ in range(len(pm.proxies)):
-            proxy_url = pm.get_proxy()
-            if proxy_url is None:
-                break
-            candidate = TelegramClient(session, int(api_id), api_hash,
-                                       **pm.telethon_kwargs(proxy_url))
-            try:
-                await candidate.start()  # Telegram phone/code/2FA login on first run.
-                client = candidate
-                print(f"Подключение через прокси: {mask_proxy_url(proxy_url)}")
-                break
-            except Exception as exc:
-                last_error = exc
-                logging.warning("Прокси %s не поднялся: %s", mask_proxy_url(proxy_url), exc)
-                pm.mark_proxy_failed(proxy_url)
-        if client is None:
-            raise SystemExit(f"Ни один прокси не подключился: {last_error}")
-    else:
-        client = TelegramClient(session, int(api_id), api_hash)
-        await client.start()  # Telegram phone/code/2FA login on first run.
+        print(f"Прокси: {len(pm.proxies)} шт., режим {pm.mode.value}. "
+              "Проверяю именно MTProto, без HTTPS health-check.")
+    client = await connect_client(str(ROOT / "telegram_session"), int(api_id), api_hash, pm)
+    try:
+        await ensure_authorized(client, method=args.auth,
+                                phone=os.environ.get("TG_PHONE"))
+        return client
+    except BaseException:
+        await client.disconnect()
+        raise
+
+
+async def login_telegram(args):
+    client = await get_authorized_telegram(args)
+    await client.disconnect()
+    print("Готово. Запусти: python main.py watch --history 1000")
+
+
+async def watch_telegram(args, db):
+    from telethon import events
+
+    client = await get_authorized_telegram(args)
     link = args.link
     link_match = re.search(r"(?:https?://)?t\.me/([\w]+)/([0-9]+)", link)
     if not link_match:
@@ -207,7 +202,12 @@ def main():
     sub.add_parser("demo", help="Расшифровать тестовые сообщения из samples/")
     src = sub.add_parser("import-file", help="Импорт текста, скопированного из Telegram")
     src.add_argument("path")
+    login = sub.add_parser("login", help="Отдельно подключить Telegram (QR или код + 2FA)")
+    login.add_argument("--auth", choices=("qr", "code"), default="qr",
+                       help="qr: вход по QR через приложение; code: код в Telegram")
     watcher = sub.add_parser("watch", help="Telegram: история + новые сообщения")
+    watcher.add_argument("--auth", choices=("qr", "code"), default="qr",
+                         help="Нужен только при первом входе; по умолчанию QR")
     watcher.add_argument("--link", default="https://t.me/SatNetworkDB/492030")
     watcher.add_argument("--topic", default="auto", help="auto, all, числовой ID темы, или название топика")
     watcher.add_argument("--topic-name", help="Название топика для поиска (переопределяет --topic)")
@@ -221,11 +221,17 @@ def main():
         import_text(ROOT / "samples" / "messages.txt", db, source="sample")
     elif args.command == "import-file":
         import_text(args.path, db)
-    elif args.command == "watch":
+    elif args.command in ("login", "watch"):
         try:
-            asyncio.run(watch_telegram(args, db))
+            if args.command == "login":
+                asyncio.run(login_telegram(args))
+            else:
+                asyncio.run(watch_telegram(args, db))
         except KeyboardInterrupt:
             print("Остановлено")
+        except Exception as exc:
+            print(f"Ошибка Telegram: {type(exc).__name__}: {exc}")
+            raise SystemExit(1) from None
     elif args.command == "export-csv":
         export_csv(db, args.path)
     db.close()
