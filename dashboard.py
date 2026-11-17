@@ -1,6 +1,8 @@
 """Local, read-only KINOSPUTNIK dashboard. Standard library; Skyfield optional."""
 import argparse
 import json
+import logging
+import html
 import math
 import sqlite3
 from contextlib import closing
@@ -188,26 +190,60 @@ def main():
     parser.add_argument("--port",type=int,default=8080)
     parser.add_argument("--limit",type=int,default=5000)
     parser.add_argument("--export",type=Path,help="Автономный HTML-снимок с RAW")
+    parser.add_argument("--check",action="store_true",help="Проверка пути БД, SQL и сериализации JSON без запуска сервера")
     a=parser.parse_args()
     if not 1<=a.limit<=20000:
         parser.error("--limit должен быть от 1 до 20000")
+    db_path=Path(a.db).expanduser().resolve()
+    a.db=str(db_path)
+    print(f"SQLite: {db_path}",flush=True)
+    if not db_path.is_file():
+        parser.exit(1,f"База не найдена: {db_path}\nУкажите реальный путь через --db.\n")
+    try:
+        startup=load_data(a.db,a.limit)
+        json.dumps(startup,ensure_ascii=False,allow_nan=False)
+    except Exception as exc:
+        logging.exception("Ошибка чтения базы %s",db_path)
+        parser.exit(1,f"SQLite / JSON: {type(exc).__name__}: {exc}\n")
+    print("SQLite: "+", ".join(f"{k}={v}" for k,v in startup["counts"].items()),flush=True)
+    if not startup["counts"]["packets"]:
+        print("ВНИМАНИЕ: База пока пустая. Проверьте путь сборщика --db.",flush=True)
+    else:
+        print(f"Последний приём UTC: {startup['packets'][-1]['received_utc']}",flush=True)
+    if a.check:
+        print("CHECK OK: SQLite → JSON",flush=True)
+        return
     page=(ROOT/"dashboard.html").read_text(encoding="utf-8")
     if a.export:
-        payload=json.dumps(load_data(a.db,a.limit),ensure_ascii=False).replace("<",r"\u003c")
+        payload=json.dumps(startup,ensure_ascii=False,allow_nan=False).replace("<",r"\u003c")
         a.export.write_text(page.replace("/* SNAPSHOT */ null",payload),encoding="utf-8")
         print(a.export)
         return
-    load_data(a.db,1)
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             url=urlsplit(self.path)
             try:
                 if url.path=="/":
-                    body=page.encode("utf-8")
+                    # Bootstrap from the same DB even if subsequent API polling fails.
+                    try:
+                        initial=load_data(a.db,a.limit)
+                        initial["db_path"]=str(db_path)
+                        payload=json.dumps(initial,ensure_ascii=False,allow_nan=False).replace("<",r"\u003c")
+                        status=f"SQLite: {db_path} | пакетов: {initial['counts']['packets']}"
+                        boot=page.replace("/* INITIAL_DATA */ null",payload,1).replace("<!-- DB_STATUS -->",html.escape(status),1)
+                    except Exception as exc:
+                        logging.exception("Ошибка первоначальной загрузки")
+                        boot=page.replace("<!-- DB_STATUS -->",html.escape(f"SQLite: {db_path} | {type(exc).__name__}: {exc}"),1)
+                    body=boot.encode("utf-8")
                     mime="text/html; charset=utf-8"
-                elif url.path in ("/api/data","/api/orbit"):
+                elif url.path in ("/api/data","/api/orbit","/api/health"):
                     if url.path=="/api/data":
                         result=load_data(a.db,a.limit)
+                        result["db_path"]=str(db_path)
+                    elif url.path=="/api/health":
+                        result=load_data(a.db,1)
+                        result=dict(status="ok",db_path=str(db_path),counts=result["counts"],
+                                    latest_utc=result["packets"][-1]["received_utc"] if result["packets"] else None)
                     else:
                         q=parse_qs(url.query)
                         lat=float(q["lat"][0]) if "lat" in q else None
@@ -226,8 +262,14 @@ def main():
                 self.send_header("X-Content-Type-Options","nosniff")
                 self.end_headers()
                 self.wfile.write(body)
-            except (sqlite3.Error,ValueError,OSError,ImportError) as exc:
-                self.send_error(500,str(exc))
+            except Exception as exc:
+                logging.exception("Ошибка запроса %s",url.path)
+                body=json.dumps({"error":f"{type(exc).__name__}: {exc}","db_path":str(db_path)},ensure_ascii=False).encode("utf-8")
+                self.send_response(500)
+                self.send_header("Content-Type","application/json; charset=utf-8")
+                self.send_header("Cache-Control","no-store")
+                self.end_headers()
+                self.wfile.write(body)
     server=ThreadingHTTPServer(("127.0.0.1",a.port),Handler)
     print(f"KINOSPUTNIK Orbit Monitor: http://127.0.0.1:{a.port}",flush=True)
     try:
