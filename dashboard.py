@@ -162,7 +162,7 @@ def forecast(path, latitude=None, longitude=None, now=None):
     points=[]
     for dt in moments:
         geo=sat.at(ts.from_datetime(dt))
-        sp=wgs84.subpoint(geo)
+        sp=wgs84.geographic_position_of(geo)
         vals=[float(sp.latitude.degrees),float(sp.longitude.degrees),float(sp.elevation.km)]
         if not all(math.isfinite(x) for x in vals):
             raise ValueError("SGP4 не смог рассчитать положение")
