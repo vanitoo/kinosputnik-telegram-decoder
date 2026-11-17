@@ -6,3 +6,7 @@ __pycache__/
 data/
 .pytest_cache/
 .venv/
+
+# Local orbit elements and snapshots
+data/*.tle
+map.html

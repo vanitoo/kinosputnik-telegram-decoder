@@ -169,3 +169,14 @@ python -m unittest discover -s tests -v
 - Документ пользователя: `Прием маяка УКВ.docx`.
 - [Telegram API: темы](https://core.telegram.org/api/forum).
 - [Telethon: чтение истории](https://docs.telethon.dev/en/stable/modules/client.html).
+
+
+## Orbit Monitor: веб-панель
+
+Карта реальных пролётов, графики, журнал, RAW/CAN, экспериментальный расширенный маяк и опциональный прогноз SGP4.
+
+```powershell
+python dashboard.py
+```
+
+Откройте http://127.0.0.1:8080. Подробнее: [DASHBOARD.md](DASHBOARD.md).
